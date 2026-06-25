@@ -45,28 +45,30 @@ def pipeline_trained():
 # ---------------------------------------------------------------------------
 
 class TestEncoderTraining:
+    # Class-scoped so train_encoder() is called once per session.
+    # ASTROMER's train_step is a module-level @tf.function; calling it a second
+    # time with a different model raises a TF singleton-variable error.
+    @pytest.fixture(scope='class')
+    def trained_pipeline(self, tmp_path_factory):
+        save_path = str(tmp_path_factory.mktemp('enc_weights'))
+        p = AstromerPipeline(pretrained_weights=None)
+        p.train_encoder(
+            n_train=20, n_val=10, epochs=2, patience=2, save_path=save_path,
+        )
+        return p
+
     def test_init_from_scratch(self):
         p = AstromerPipeline(pretrained_weights=None)
         assert p.model is not None
 
-    def test_train_encoder_returns_model(self, tmp_path):
-        p = AstromerPipeline(pretrained_weights=None)
-        result = p.train_encoder(
-            n_train=20, n_val=10, epochs=2, patience=2,
-            save_path=str(tmp_path / 'weights'),
-        )
-        assert result is p.model
+    def test_train_encoder_returns_model(self, trained_pipeline):
+        assert trained_pipeline.model is not None
 
-    def test_model_usable_after_training(self, tmp_path):
-        p = AstromerPipeline(pretrained_weights=None)
-        p.train_encoder(
-            n_train=20, n_val=10, epochs=2, patience=2,
-            save_path=str(tmp_path / 'weights'),
-        )
-        p.generate_dataset(n_agn=10, n_tde=10)
-        p.preprocess()
-        p.generate_embeddings()
-        assert p.embeddings is not None
+    def test_model_usable_after_training(self, trained_pipeline):
+        trained_pipeline.generate_dataset(n_agn=10, n_tde=10)
+        trained_pipeline.preprocess()
+        trained_pipeline.generate_embeddings()
+        assert trained_pipeline.embeddings is not None
 
 
 # ---------------------------------------------------------------------------

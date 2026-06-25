@@ -15,10 +15,115 @@ class AstromerPipeline:
     def __init__(self, seed=42, pretrained_weights='macho'):
         from ASTROMER.models import SingleBandEncoder
         self.generator = SyntheticTransientGenerator(seed=seed)
-        self.model = SingleBandEncoder()
-        self.model = self.model.from_pretraining(pretrained_weights)
+        if pretrained_weights is None:
+            # MACHO-equivalent architecture, random weights — for training from scratch
+            self.model = SingleBandEncoder(
+                num_layers=2, d_model=256, num_heads=4, dff=128, maxlen=200,
+            )
+        else:
+            self.model = SingleBandEncoder()
+            self.model = self.model.from_pretraining(pretrained_weights)
         self.embeddings = None
         self.labels = None
+
+    def train_encoder(self, n_train=2000, n_val=500,
+                      cadence_days=3, duration_days=1000,
+                      msk_frac=0.5, rnd_frac=0.1, same_frac=0.1,
+                      batch_size=32, epochs=100, patience=20, lr=1e-3,
+                      save_path='weights/custom'):
+        """
+        Self-supervised pre-training of the ASTROMER encoder on synthetic light curves.
+
+        Uses masked magnitude reconstruction (BERT-style): a fraction of observations are
+        hidden, and the encoder is trained to reconstruct them. Labels are not used.
+
+        Parameters
+        ----------
+        n_train : int
+            Number of light curves for the training set.
+        n_val : int
+            Number of light curves for the validation set.
+        cadence_days : float
+            Observation cadence in days.
+        duration_days : float
+            Light curve duration in days.
+        msk_frac : float
+            Fraction of observations masked for reconstruction.
+        rnd_frac : float
+            Fraction of masked values replaced with random observations (BERT strategy).
+        same_frac : float
+            Fraction of masked values left unmasked but still scored by the loss.
+        batch_size : int
+        epochs : int
+            Maximum training epochs.
+        patience : int
+            Early-stopping patience in epochs.
+        lr : float
+            Adam learning rate.
+        save_path : str
+            Directory for TF checkpoints and TensorBoard logs.
+
+        Returns
+        -------
+        SingleBandEncoder
+            The trained encoder (also updated in-place as ``self.model``).
+        """
+        from ASTROMER.preprocessing import make_pretraining
+
+        half_train, half_val = n_train // 2, n_val // 2
+
+        print(f"Generating {n_train} training and {n_val} validation light curves...")
+        train_lcs = (
+            self.generator.generate_agn(
+                n_objects=half_train, cadence_days=cadence_days,
+                duration_days=duration_days, include_flares=True, flare_fraction=0.5,
+            )
+            + self.generator.generate_tde(
+                n_objects=half_train, cadence_days=cadence_days,
+                duration_days=duration_days,
+            )
+        )
+        val_lcs = (
+            self.generator.generate_agn(
+                n_objects=half_val, cadence_days=cadence_days,
+                duration_days=duration_days, include_flares=True, flare_fraction=0.5,
+            )
+            + self.generator.generate_tde(
+                n_objects=half_val, cadence_days=cadence_days,
+                duration_days=duration_days,
+            )
+        )
+
+        def _preprocess(lcs):
+            return [
+                np.column_stack([lc[:, 0] - lc[:, 0].mean(),
+                                 lc[:, 1] - lc[:, 1].mean(),
+                                 lc[:, 2]])
+                for lc in lcs
+            ]
+
+        train_lcs = _preprocess(train_lcs)
+        val_lcs = _preprocess(val_lcs)
+
+        print("Preparing batches...")
+        train_batches = make_pretraining(
+            train_lcs, batch_size=batch_size, max_obs=self.model.maxlen,
+            msk_frac=msk_frac, rnd_frac=rnd_frac, same_frac=same_frac, shuffle=True,
+        )
+        valid_batches = make_pretraining(
+            val_lcs, batch_size=batch_size, max_obs=self.model.maxlen,
+            msk_frac=msk_frac, rnd_frac=rnd_frac, same_frac=same_frac,
+        )
+
+        print(f"Training encoder for up to {epochs} epochs (patience={patience})...")
+        self.model.fit(
+            train_batches, valid_batches,
+            epochs=epochs, patience=patience, lr=lr,
+            project_path=save_path,
+        )
+
+        print(f"Weights saved to {save_path}/weights")
+        return self.model
 
     def generate_dataset(self, n_agn=500, n_tde=500, cadence_days=3, duration_days=1000):
         """Generate synthetic AGN and TDE light curves."""

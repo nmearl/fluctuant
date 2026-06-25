@@ -357,12 +357,31 @@ class AstromerPipeline:
 
         return clf, (X_train, X_test, y_train, y_test, y_proba)
 
-    def visualize_embeddings(self, save_path=None):
-        """t-SNE projection of ASTROMER embeddings, colored by class."""
+    def visualize_embeddings(self, save_path=None, pca_components=50):
+        """
+        t-SNE projection of ASTROMER embeddings, colored by class.
+
+        PCA is applied first to reduce to ``pca_components`` dimensions before
+        t-SNE. Skipping this step on high-dimensional embeddings (>~100 dims)
+        degrades t-SNE quality significantly.
+
+        Parameters
+        ----------
+        save_path : str, optional
+        pca_components : int or None
+            Number of PCA components to retain before t-SNE. Pass ``None`` to
+            skip PCA (not recommended for embeddings with many dimensions).
+        """
         from sklearn.manifold import TSNE
+        from sklearn.decomposition import PCA
+
+        embs = self.embeddings
+        if pca_components is not None and embs.shape[1] > pca_components:
+            print(f"PCA: {embs.shape[1]} → {pca_components} dims...")
+            embs = PCA(n_components=pca_components, random_state=42).fit_transform(embs)
 
         print("Generating t-SNE...")
-        emb_2d = TSNE(n_components=2, random_state=42).fit_transform(self.embeddings)
+        emb_2d = TSNE(n_components=2, random_state=42, perplexity=30).fit_transform(embs)
 
         fig, ax = plt.subplots(figsize=(10, 8))
         for i, (color, label) in enumerate(zip(['#3498db', '#e74c3c'], ['AGN', 'TDE'])):

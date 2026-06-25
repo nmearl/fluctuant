@@ -125,22 +125,41 @@ class AstromerPipeline:
         print(f"Weights saved to {save_path}/weights")
         return self.model
 
-    def generate_dataset(self, n_agn=500, n_tde=500, cadence_days=3, duration_days=1000):
-        """Generate synthetic AGN and TDE light curves."""
+    def generate_dataset(self, n_agn=500, n_tde=500, cadence_days=3, duration_days=1000,
+                         multiband=False):
+        """
+        Generate synthetic AGN and TDE light curves.
+
+        Parameters
+        ----------
+        n_agn : int
+        n_tde : int
+        cadence_days : float
+        duration_days : float
+        multiband : bool
+            If True, generate paired g/r light curves. Each element of
+            ``self.light_curves`` will be a dict with keys ``'g'`` and ``'r'``.
+        """
         print(f"Generating {n_agn} AGN and {n_tde} TDE light curves...")
 
-        agn_lcs = self.generator.generate_agn(
-            n_objects=n_agn,
-            cadence_days=cadence_days,
-            duration_days=duration_days,
-            include_flares=True,
-            flare_fraction=0.5,
-        )
-        tde_lcs = self.generator.generate_tde(
-            n_objects=n_tde,
-            cadence_days=cadence_days,
-            duration_days=duration_days,
-        )
+        if multiband:
+            agn_lcs = self.generator.generate_agn_multiband(
+                n_objects=n_agn, cadence_days=cadence_days,
+                duration_days=duration_days, include_flares=True, flare_fraction=0.5,
+            )
+            tde_lcs = self.generator.generate_tde_multiband(
+                n_objects=n_tde, cadence_days=cadence_days,
+                duration_days=duration_days,
+            )
+        else:
+            agn_lcs = self.generator.generate_agn(
+                n_objects=n_agn, cadence_days=cadence_days,
+                duration_days=duration_days, include_flares=True, flare_fraction=0.5,
+            )
+            tde_lcs = self.generator.generate_tde(
+                n_objects=n_tde, cadence_days=cadence_days,
+                duration_days=duration_days,
+            )
 
         self.light_curves = agn_lcs + tde_lcs
         self.labels = np.array([0] * n_agn + [1] * n_tde)
@@ -154,20 +173,61 @@ class AstromerPipeline:
 
     def preprocess(self):
         """Subtract per-light-curve mean from times and magnitudes for ASTROMER."""
-        processed = []
-        for lc in self.light_curves:
-            times = lc[:, 0] - lc[:, 0].mean()
-            mags = lc[:, 1] - lc[:, 1].mean()
-            errs = lc[:, 2]
-            processed.append(np.column_stack([times, mags, errs]))
-        self.light_curves = processed
+        if isinstance(self.light_curves[0], dict):
+            # Save uncentered data so generate_embeddings can compute absolute color.
+            self._raw_light_curves = self.light_curves
+            self.light_curves = [
+                {band: np.column_stack([
+                    lc[band][:, 0] - lc[band][:, 0].mean(),
+                    lc[band][:, 1] - lc[band][:, 1].mean(),
+                    lc[band][:, 2],
+                ]) for band in lc}
+                for lc in self.light_curves
+            ]
+        else:
+            processed = []
+            for lc in self.light_curves:
+                times = lc[:, 0] - lc[:, 0].mean()
+                mags = lc[:, 1] - lc[:, 1].mean()
+                errs = lc[:, 2]
+                processed.append(np.column_stack([times, mags, errs]))
+            self.light_curves = processed
         return self.light_curves
 
     def generate_embeddings(self):
         """Extract multi-statistic feature vectors from ASTROMER encoder output."""
-        print("Generating embeddings...")
-        raw_embeddings = self.model.encode(self.light_curves)
+        if isinstance(self.light_curves[0], dict):
+            bands = list(self.light_curves[0].keys())
+            per_band = []
+            for band in bands:
+                print(f"Generating {band}-band embeddings...")
+                band_lcs = [lc[band] for lc in self.light_curves]
+                per_band.append(self._pool_encoder_output(self.model.encode(band_lcs)))
 
+            raw_lcs = getattr(self, '_raw_light_curves', self.light_curves)
+            cross = self._compute_cross_band_features(raw_lcs)
+
+            self.embeddings = np.hstack(per_band + [cross])
+        else:
+            print("Generating embeddings...")
+            self.embeddings = self._pool_encoder_output(
+                self.model.encode(self.light_curves)
+            )
+
+        print(f"Embeddings shape: {self.embeddings.shape}")
+        return self.embeddings
+
+    def _pool_encoder_output(self, raw_embeddings):
+        """Apply 7-statistic pooling over the temporal dimension of encoder output.
+
+        Parameters
+        ----------
+        raw_embeddings : list of ndarray, shape (n_obs, d_model)
+
+        Returns
+        -------
+        ndarray, shape (n_lightcurves, 7 * d_model)
+        """
         pooled = []
         for emb in raw_embeddings:
             mean_feat = emb.mean(axis=0)
@@ -178,16 +238,62 @@ class AstromerPipeline:
             skew_approx = (mean_feat - np.median(emb, axis=0)) / (std_feat + 1e-8)
             early_mean = emb[:len(emb) // 3].mean(axis=0)
             late_mean = emb[-len(emb) // 3:].mean(axis=0)
-
             pooled.append(np.concatenate([
                 mean_feat, std_feat, p25, p75,
                 temporal_grad, skew_approx,
                 early_mean - late_mean,
             ]))  # 7 × d_model features
+        return np.vstack(pooled)
 
-        self.embeddings = np.vstack(pooled)
-        print(f"Embeddings shape: {self.embeddings.shape}")
-        return self.embeddings
+    def _compute_cross_band_features(self, light_curves):
+        """
+        Compute color features from paired g/r light curves.
+
+        Matches contemporaneous epochs (within 2 days) across bands and derives
+        four scalar features per object: mean color, color variability, color
+        evolution slope, and color at peak g-band brightness.
+
+        Parameters
+        ----------
+        light_curves : list of dict
+            Uncentered multi-band light curves with keys ``'g'`` and ``'r'``.
+
+        Returns
+        -------
+        ndarray, shape (n_objects, 4)
+            Columns: [mean_color, color_std, color_slope, peak_color].
+        """
+        features = []
+        for lc in light_curves:
+            times_g, mags_g = lc['g'][:, 0], lc['g'][:, 1]
+            times_r, mags_r = lc['r'][:, 0], lc['r'][:, 1]
+
+            colors, color_times = [], []
+            for i, tg in enumerate(times_g):
+                diffs = np.abs(times_r - tg)
+                j = np.argmin(diffs)
+                if diffs[j] <= 2.0:
+                    colors.append(mags_g[i] - mags_r[j])
+                    color_times.append(tg)
+
+            if len(colors) < 3:
+                colors = [mags_g.mean() - mags_r.mean()]
+                color_times = [times_g.mean()]
+
+            colors = np.array(colors)
+            color_times = np.array(color_times)
+
+            mean_color = colors.mean()
+            color_std = colors.std()
+            color_slope = np.polyfit(color_times, colors, 1)[0] if len(colors) > 2 else 0.0
+
+            peak_idx = np.argmin(mags_g)
+            j = np.argmin(np.abs(times_r - times_g[peak_idx]))
+            peak_color = mags_g[peak_idx] - mags_r[j]
+
+            features.append([mean_color, color_std, color_slope, peak_color])
+
+        return np.array(features)
 
     def train_classifier(self, test_size=0.3, tune_hyperparams=False):
         """Train a Random Forest classifier on scaled ASTROMER embeddings.

@@ -225,6 +225,112 @@ class SyntheticTransientGenerator:
 
         return mags
 
+    def generate_agn_multiband(self, n_objects=100, cadence_days=3, duration_days=1000,
+                               baseline_mag=19.0, noise_level=0.05,
+                               include_flares=True, flare_fraction=0.3):
+        """
+        Generate AGN light curves in g and r bands.
+
+        r-band variability is 75% of g-band amplitude; r is ~0.3 mag brighter.
+        r observations are offset by 1 day (ZTF alternating cadence).
+
+        Parameters
+        ----------
+        n_objects : int
+        cadence_days : float
+        duration_days : float
+        baseline_mag : float
+            g-band quiescent magnitude.
+        noise_level : float
+        include_flares : bool
+        flare_fraction : float
+
+        Returns
+        -------
+        list of dict
+            Each dict has keys ``'g'`` and ``'r'``, each an ndarray of
+            shape ``(n_obs, 3)`` with columns [time, mag, err].
+        """
+        light_curves = []
+        for _ in range(n_objects):
+            times_g = self.generate_irregular_times(duration_days, cadence_days)
+            times_r = times_g + 1.0
+            n_obs = len(times_g)
+
+            tau = np.random.uniform(50, 300)
+            sf_inf_g = np.random.uniform(0.05, 0.15)
+            sf_inf_r = sf_inf_g * 0.75
+
+            mags_g = self.damped_random_walk(times_g, tau, sf_inf_g, baseline_mag)
+            mags_r = self.damped_random_walk(times_r, tau, sf_inf_r, baseline_mag - 0.3)
+
+            if include_flares and np.random.random() < flare_fraction:
+                flare = self.get_flare_model(times_g)
+                mags_g = mags_g - flare
+                mags_r = mags_r - flare * 0.8
+
+            errors_g = np.random.uniform(0.03, noise_level, n_obs)
+            errors_r = np.random.uniform(0.03, noise_level, n_obs)
+            mags_g += np.random.normal(0, errors_g)
+            mags_r += np.random.normal(0, errors_r)
+
+            light_curves.append({
+                'g': np.column_stack([times_g, mags_g, errors_g]),
+                'r': np.column_stack([times_r, mags_r, errors_r]),
+            })
+        return light_curves
+
+    def generate_tde_multiband(self, n_objects=100, cadence_days=3, duration_days=1000,
+                               baseline_mag=19.0, noise_level=0.05):
+        """
+        Generate TDE light curves in g and r bands.
+
+        TDEs are bluer than AGN: r-band flare amplitude is ~55% of g-band.
+        r observations are offset by 1 day (ZTF alternating cadence).
+
+        Parameters
+        ----------
+        n_objects : int
+        cadence_days : float
+        duration_days : float
+        baseline_mag : float
+            g-band quiescent magnitude.
+        noise_level : float
+
+        Returns
+        -------
+        list of dict
+            Each dict has keys ``'g'`` and ``'r'``, each an ndarray of
+            shape ``(n_obs, 3)`` with columns [time, mag, err].
+        """
+        light_curves = []
+        for _ in range(n_objects):
+            times_g = self.generate_irregular_times(duration_days, cadence_days)
+            times_r = times_g + 1.0
+            n_obs = len(times_g)
+
+            t0 = np.random.uniform(100, 400)
+            rise_time = np.random.uniform(10, 40)
+            amplitude_g = np.random.uniform(1.5, 4.0)
+            amplitude_r = amplitude_g * np.random.uniform(0.5, 0.6)
+            decay_power = np.random.uniform(-5 / 3, -1.0)
+
+            mags_g = self.tde_lightcurve(times_g, t0, rise_time, amplitude_g,
+                                          decay_power, baseline_mag)
+            mags_r = self.tde_lightcurve(times_r, t0, rise_time, amplitude_r,
+                                          decay_power, baseline_mag - 0.2)
+
+            errors_g = np.random.uniform(0.03, noise_level, n_obs)
+            errors_r = np.random.uniform(0.03, noise_level, n_obs)
+            mags_g += np.random.normal(0, errors_g)
+            mags_r += np.random.normal(0, errors_r)
+
+            light_curves.append({
+                'g': np.column_stack([times_g, mags_g, errors_g]),
+                'r': np.column_stack([times_r, mags_r, errors_r]),
+            })
+        return light_curves
+
     def plot_with_model_overlay(self, n_examples=3):
         """Plot AGN and TDE light curves with model components overlaid."""
         fig, axes = plt.subplots(2, n_examples, figsize=(15, 10))
